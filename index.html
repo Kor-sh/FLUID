@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<title>FLUID SIMULATION (Canvas)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #111319; overflow: hidden;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans KR", Arial;
+  }
+  #wrap { position: fixed; inset: 0; display: grid; place-items: center; }
+  canvas { background:#111319; display:block; box-shadow: 0 0 40px rgba(0,0,0,0.35); }
+  .hud {
+    position: fixed; left: 12px; top: 10px; right: 12px; pointer-events: none;
+    color: #d2dce6; font-size: 14px; text-shadow: 0 1px 0 rgba(0,0,0,0.3);
+    letter-spacing: .2px; line-height: 1.3;
+  }
+  .hint {
+    position: fixed; left: 12px; bottom: 10px; right: 12px; pointer-events: none;
+    color: #9cb3cf; font-size: 12px; opacity: .8;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="800" height="1350"></canvas>
+</div>
+<div class="hud" id="hud"></div>
+<div class="hint">
+  LMB: attract &nbsp; | &nbsp; RMB drag: obstacle &nbsp; | &nbsp; Wheel/MMB: spawn &nbsp; | &nbsp;
+  Space:Pause R:Reset G:Gravity Home:Stop End:ClearWater C:ClearObs Delete:Remove hovered &nbsp;|&nbsp; M:Accel-Heatmap
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------------- 설정 ----------------
+  const WIDTH = 3200, HEIGHT = 1800;
+  let N = 5000;
+  const R = 4;
+  const DT = 1/60;
+  const DAMPING = 0.986;
+  const BOUNCE = 0.8;
+  let GRAVITY_ON = true;
+  const GRAVITY = {x: 0.0, y: 120.0};
+
+  // 상호작용
+  let S = 2*R + 10;    // 선호 거리
+  let W = 24;          // 인력 대역
+  let CUT = S + W;
+  const K_REP = 1500.0;
+  const K_ATT = 18.0;
+  const ATTR_NEAREST_K = 1;
+  const EPS = 1e-9;
+
+  // 과밀 억제
+  const DENSITY_R = S * 1.0;
+  const DENSITY_CAP = 2;
+  const K_DENS = 900.0;
+  const DENS_DIR_WEIGHT = 1.0;
+
+  // 포지션 보정
+  const SEP_ITERS = 1;
+  const S_MIN = 2*R + 3;
+  const BAUMGARTE = 0.35;
+
+  // 마우스 흡인
+  const MOUSE_ATTR_RADIUS = 320;
+  const K_MOUSE = 24.0;
+  const C_MOUSE = 2.0 * Math.sqrt(K_MOUSE);
+  const LOCAL_DRAG = 0.90;
+  const VMAX = 360.0;
+
+  // 입자 생성
+  const SPAWN_PER_WHEEL_UP = 60;
+  const SPAWN_PER_WHEEL_DOWN = 30;
+  const SPAWN_SPREAD = 28;
+  const MAX_PARTS = 15000;
+
+  // 휠 클릭(MMB)
+  const SPAWN_PER_MMB_TAP  = 80;
+  const SPAWN_PER_MMB_HOLD = 18;
+
+  // 가속도 히트맵 스케일(빨강이 되는 기준 a). 상황에 따라 600~2000 사이에서 취향대로 조절.
+  let ACCEL_RED = 6500;
+  const ACCEL_EMA_ALPHA = 0.1;  // EMA 부드럽기 (0.2~0.4 권장)
+
+  // Spatial hash
+  let CELL = CUT;
+
+  // ---------- 캔버스 ----------
+  const cv = document.getElementById('cv');
+  const hud = document.getElementById('hud');
+  const ctx = cv.getContext('2d');
+  function setupHiDPI() {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    cv.style.width = WIDTH + 'px';
+    cv.style.height = HEIGHT + 'px';
+    cv.width = Math.floor(WIDTH * dpr);
+    cv.height = Math.floor(HEIGHT * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  setupHiDPI();
+  window.addEventListener('resize', setupHiDPI);
+
+  // ---------- 유틸 ----------
+  const rnd = Math.random;
+  function clamp(v, a, b){ return v < a ? a : (v > b ? b : v); }
+  function hashPos(x, y){ return ((x / CELL) | 0) + ',' + ((y / CELL) | 0); }
+  function pointInRect(x,y,o){ return (o.l<=x && x<=o.r && o.t<=y && y<=o.b); }
+
+  // ---------- 상태 ----------
+  /** @type {{x:number,y:number,vx:number,vy:number}[]} */
+  let parts = [];
+  /** @type {Float32Array} */ let accelEMA = new Float32Array(0); // 가속도 EMA
+  let densityMode = true; // M 키 토글
+
+  function ensureAccelLen() {
+    if (accelEMA.length !== parts.length) {
+      const old = accelEMA;
+      accelEMA = new Float32Array(parts.length);
+      if (old && old.length) accelEMA.set(old.subarray(0, Math.min(old.length, accelEMA.length)));
+    }
+  }
+
+  function resetParticles(n = N){
+    parts = [];
+    const pad = 50;
+    for(let i=0;i<n;i++){
+      parts.push({
+        x: pad + rnd()*(WIDTH-2*pad),
+        y: pad + rnd()*(HEIGHT-2*pad),
+        vx: 0, vy: 0
+      });
+    }
+    accelEMA = new Float32Array(parts.length);
+  }
+  resetParticles();
+
+  /** @type {{l:number,t:number,r:number,b:number}[]} */
+  let obstacles = [];
+
+  // 마우스/키 입력
+  let paused = false;
+  let mouseX = 0, mouseY = 0;
+  let lmb = false, rmb = false, mmb = false;
+  let rmbStart = {x:0, y:0};
+
+  // 컨텍스트 메뉴 막기(우클릭)
+  cv.addEventListener('contextmenu', e => e.preventDefault(), {passive:false});
+
+  // 마우스 이벤트
+  cv.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    const rect = cv.getBoundingClientRect();
+    mouseX = (e.clientX - rect.left);
+    mouseY = (e.clientY - rect.top);
+    if (e.button === 0) lmb = true;
+    else if (e.button === 2){ rmb = true; rmbStart = {x:mouseX, y:mouseY}; }
+    else if (e.button === 1){
+      mmb = true;
+      spawnParticlesAt(mouseX, mouseY, SPAWN_PER_MMB_TAP);
+    }
+  }, {passive:false});
+
+  cv.addEventListener('mouseup', (e) => {
+    e.preventDefault();
+    if (e.button === 0) lmb = false;
+    else if (e.button === 2){
+      if (rmb){
+        rmb = false;
+        addObstacle(rmbStart.x, rmbStart.y, mouseX, mouseY);
+      }
+    } else if (e.button === 1){
+      mmb = false;
+    }
+  }, {passive:false});
+
+  cv.addEventListener('mousemove', (e) => {
+    const rect = cv.getBoundingClientRect();
+    mouseX = (e.clientX - rect.left);
+    mouseY = (e.clientY - rect.top);
+  }, {passive:true});
+
+  // 휠 스크롤로 스폰
+  cv.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (e.deltaY < 0) spawnParticlesAt(mouseX, mouseY, SPAWN_PER_WHEEL_UP * Math.min(5, Math.ceil(-e.deltaY/100)));
+    else if (e.deltaY > 0) spawnParticlesAt(mouseX, mouseY, SPAWN_PER_WHEEL_DOWN * Math.min(5, Math.ceil(e.deltaY/100)));
+  }, {passive:false});
+
+  // 키보드
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space'){ paused = !paused; e.preventDefault(); }
+    else if (e.key === 'r' || e.key === 'R'){ resetParticles(); }
+    else if (e.key === 'g' || e.key === 'G'){ GRAVITY_ON = !GRAVITY_ON; }
+    else if (e.key === 'c' || e.key === 'C'){ obstacles.length = 0; }
+    else if (e.key === 'Delete'){
+      for (let i = obstacles.length-1; i >= 0; i--){
+        const o = obstacles[i];
+        if (pointInRect(mouseX, mouseY, o)){ obstacles.splice(i,1); break; }
+      }
+    } else if (e.key === 'Home'){
+      for (const p of parts){ p.vx = 0; p.vy = 0; }
+      accelEMA.fill(0);
+    } else if (e.key === 'End'){
+      parts.length = 0;
+      accelEMA = new Float32Array(0);
+    } else if (e.key === 'm' || e.key === 'M'){
+      densityMode = !densityMode;
+    } else if (e.key === '+'){  // 히트맵 감도 ↑
+      ACCEL_RED *= 0.9;
+    } else if (e.key === '-'){  // 히트맵 감도 ↓
+      ACCEL_RED *= 1.1;
+    }
+  }, {passive:false});
+
+  function addObstacle(x0, y0, x1, y1){
+    let l = Math.min(x0,x1), r = Math.max(x0,x1);
+    let t = Math.min(y0,y1), b = Math.max(y0,y1);
+    if (r - l < 2) r = l + 2;
+    if (b - t < 2) b = t + 2;
+    l = clamp(l, 0, WIDTH); r = clamp(r, 0, WIDTH);
+    t = clamp(t, 0, HEIGHT); b = clamp(b, 0, HEIGHT);
+    obstacles.push({l,t,r,b});
+  }
+
+  function collideCircleAABB(x, y, vx, vy, o, radius, bounce){
+    const cx = clamp(x, o.l, o.r);
+    const cy = clamp(y, o.t, o.b);
+    let dx = x - cx, dy = y - cy;
+    let d2 = dx*dx + dy*dy;
+    if (d2 >= radius*radius) return {x, y, vx, vy, hit:false};
+    if (d2 > 1e-12){
+      const d = Math.sqrt(d2), nx = dx/d, ny = dy/d;
+      const pen = radius - d;
+      x += nx * pen; y += ny * pen;
+      const vn = vx*nx + vy*ny;
+      vx -= (1 + bounce) * vn * nx;
+      vy -= (1 + bounce) * vn * ny;
+      return {x,y,vx,vy,hit:true};
+    }
+    const leftPen = Math.abs(o.l - x) + 1e-6;
+    const rightPen = Math.abs(x - o.r) + 1e-6;
+    const topPen = Math.abs(o.t - y) + 1e-6;
+    const bottomPen = Math.abs(y - o.b) + 1e-6;
+    const m = Math.min(leftPen, rightPen, topPen, bottomPen);
+    if (m === leftPen){ x = o.l - radius; vx = -vx * bounce; }
+    else if (m === rightPen){ x = o.r + radius; vx = -vx * bounce; }
+    else if (m === topPen){ y = o.t - radius; vy = -vy * bounce; }
+    else { y = o.b + radius; vy = -vy * bounce; }
+    return {x,y,vx,vy,hit:true};
+  }
+
+  function spawnParticlesAt(mx,my,count){
+    const remain = Math.max(0, MAX_PARTS - parts.length);
+    if (remain <= 0) return;
+    count = Math.min(count, remain);
+    for (let i=0;i<count;i++){
+      const ang = rnd()*Math.PI*2;
+      const rad = rnd()*SPAWN_SPREAD;
+      let x = mx + Math.cos(ang)*rad;
+      let y = my + Math.sin(ang)*rad;
+      x = clamp(x, R, WIDTH-R);
+      y = clamp(y, R, HEIGHT-R);
+      const vx = (rnd()*2-1)*40;
+      const vy = (rnd()*2-1)*40;
+      parts.push({x,y,vx,vy});
+    }
+    ensureAccelLen();
+  }
+
+  // ---------- 메인 루프 ----------
+  let acc = 0, last = performance.now();
+
+  function step(){
+    const now = performance.now();
+    let dtms = (now - last); if (dtms > 60) dtms = 60;
+    last = now;
+    acc += dtms/1000;
+
+    while (acc >= DT){
+      tick(DT);
+      acc -= DT;
+    }
+    render();
+    requestAnimationFrame(step);
+  }
+
+  function tick(dt){
+    if (mmb) spawnParticlesAt(mouseX, mouseY, SPAWN_PER_MMB_HOLD);
+
+    // grid 구축
+    /** @type {Map<string, number[]>} */
+    const grid = new Map();
+    for (let i=0;i<parts.length;i++){
+      const p = parts[i];
+      const key = hashPos(p.x, p.y);
+      const arr = grid.get(key);
+      if (arr) arr.push(i); else grid.set(key, [i]);
+    }
+
+    if (!paused){
+      const nP = parts.length;
+      const forcesX = new Float32Array(nP);
+      const forcesY = new Float32Array(nP);
+      const denseCnt = new Int16Array(nP);
+      const denseDirX = new Float32Array(nP);
+      const denseDirY = new Float32Array(nP);
+      const attrBudget = new Int8Array(nP);
+      attrBudget.fill(ATTR_NEAREST_K);
+
+      const CUT2 = CUT*CUT, S2 = S*S, DR2 = DENSITY_R*DENSITY_R;
+
+      for (const [k, idxs] of grid.entries()){
+        const [cx, cy] = k.split(',').map(Number);
+        const cellLists = [idxs,
+          grid.get((cx+1)+','+(cy+0))||[],
+          grid.get((cx+0)+','+(cy+1))||[],
+          grid.get((cx+1)+','+(cy+1))||[],
+          grid.get((cx-1)+','+(cy+1))||[]
+        ];
+
+        // 1) 자기 셀
+        const L0 = cellLists[0];
+        for (let a=0;a<L0.length;a++){
+          const i = L0[a];
+          const pi = parts[i];
+          const xi=pi.x, yi=pi.y;
+          for (let b=a+1;b<L0.length;b++){
+            const j = L0[b];
+            const pj = parts[j];
+            const dx = xi - pj.x, dy = yi - pj.y;
+            const d2 = dx*dx + dy*dy;
+            if (d2 < EPS || d2 > CUT2) continue;
+            const d = Math.sqrt(d2), invd = 1.0/d;
+            const ux = dx*invd, uy = dy*invd;
+
+            if (d2 <= DR2){
+              denseCnt[i]++; denseCnt[j]++;
+              denseDirX[i] += ux; denseDirY[i] += uy;
+              denseDirX[j] -= ux; denseDirY[j] -= uy;
+            }
+
+            if (d2 < S2){
+              const mag = K_REP * (S - d) * invd;
+              const fx = ux*mag, fy = uy*mag;
+              forcesX[i]+=fx; forcesY[i]+=fy;
+              forcesX[j]-=fx; forcesY[j]-=fy;
+            } else {
+              if (attrBudget[i] > 0 && attrBudget[j] > 0){
+                const t = (d - S) / W;
+                const peak = 1.0 - Math.abs(2*t - 1.0);
+                const mag = -K_ATT * peak;
+                const fx = ux*mag, fy = uy*mag;
+                forcesX[i]+=fx; forcesY[i]+=fy;
+                forcesX[j]-=fx; forcesY[j]-=fy;
+                attrBudget[i]--; attrBudget[j]--;
+              }
+            }
+          }
+        }
+
+        // 2) 이웃 셀 쌍
+        for (let li=1; li<cellLists.length; li++){
+          const neigh = cellLists[li];
+          for (let a=0;a<L0.length;a++){
+            const i = L0[a];
+            const pi = parts[i];
+            const xi=pi.x, yi=pi.y;
+            for (let b=0;b<neigh.length;b++){
+              const j = neigh[b];
+              const pj = parts[j];
+              const dx = xi - pj.x, dy = yi - pj.y;
+              const d2 = dx*dx + dy*dy;
+              if (d2 < EPS || d2 > CUT2) continue;
+              const d = Math.sqrt(d2), invd = 1.0/d;
+              const ux = dx*invd, uy = dy*invd;
+
+              if (d2 <= DR2){
+                denseCnt[i]++; denseCnt[j]++;
+                denseDirX[i] += ux; denseDirY[i] += uy;
+                denseDirX[j] -= ux; denseDirY[j] -= uy;
+              }
+
+              if (d2 < S2){
+                const mag = K_REP * (S - d) * invd;
+                const fx = ux*mag, fy = uy*mag;
+                forcesX[i]+=fx; forcesY[i]+=fy;
+                forcesX[j]-=fx; forcesY[j]-=fy;
+              } else {
+                if (attrBudget[i] > 0 && attrBudget[j] > 0){
+                  const t = (d - S) / W;
+                  const peak = 1.0 - Math.abs(2*t - 1.0);
+                  const mag = -K_ATT * peak;
+                  const fx = ux*mag, fy = uy*mag;
+                  forcesX[i]+=fx; forcesY[i]+=fy;
+                  forcesX[j]-=fx; forcesY[j]-=fy;
+                  attrBudget[i]--; attrBudget[j]--;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 과밀 억제 힘(방향성)
+      for (let i=0;i<parts.length;i++){
+        const over = denseCnt[i] - DENSITY_CAP;
+        if (over > 0){
+          let dx = denseDirX[i], dy = denseDirY[i];
+          let mag = K_DENS * over;
+          const len2 = dx*dx + dy*dy;
+          if (len2 > 1e-8){
+            const inv = 1.0 / Math.sqrt(len2);
+            dx *= inv; dy *= inv;
+            forcesX[i] += dx * mag * DENS_DIR_WEIGHT;
+            forcesY[i] += dy * mag * DENS_DIR_WEIGHT;
+          }
+          // 소량 랜덤 벌점
+          forcesX[i] += (Math.random()*2-1) * mag * (1.0 - DENS_DIR_WEIGHT) * 0.05;
+          forcesY[i] += (Math.random()*2-1) * mag * (1.0 - DENS_DIR_WEIGHT) * 0.05;
+        }
+      }
+
+      // 마우스 스프링-댐퍼
+      if (lmb){
+        const r2max = MOUSE_ATTR_RADIUS*MOUSE_ATTR_RADIUS;
+        const rCells = Math.ceil(MOUSE_ATTR_RADIUS / CELL);
+        const baseCx = (mouseX / CELL | 0), baseCy = (mouseY / CELL | 0);
+        for (let dcx=-rCells; dcx<=rCells; dcx++){
+          for (let dcy=-rCells; dcy<=rCells; dcy++){
+            const arr = grid.get((baseCx+dcx)+','+(baseCy+dcy));
+            if (!arr) continue;
+            for (const i of arr){
+              const p = parts[i];
+              const dx = mouseX - p.x, dy = mouseY - p.y;
+              const d2 = dx*dx + dy*dy;
+              if (EPS < d2 && d2 <= r2max){
+                const d = Math.sqrt(d2), invd = 1.0/d;
+                const ux = dx*invd, uy = dy*invd;
+                const fx = ux * (K_MOUSE*d) - C_MOUSE * p.vx;
+                const fy = uy * (K_MOUSE*d) - C_MOUSE * p.vy;
+                forcesX[i] += fx; forcesY[i] += fy;
+                p.vx *= LOCAL_DRAG; p.vy *= LOCAL_DRAG;
+              }
+            }
+          }
+        }
+      }
+
+      // 중력
+      if (GRAVITY_ON){
+        for (let i=0;i<parts.length;i++){
+          forcesX[i] += GRAVITY.x;
+          forcesY[i] += GRAVITY.y;
+        }
+      }
+
+      // === 가속도(=힘) 크기 기반 히트맵 값 계산 + EMA 저장 ===
+      ensureAccelLen();
+      for (let i=0;i<parts.length;i++){
+        const ax = forcesX[i];  // 질량=1 가정
+        const ay = forcesY[i];
+        const a = Math.hypot(ax, ay);
+        accelEMA[i] = accelEMA[i]*(1-ACCEL_EMA_ALPHA) + a*ACCEL_EMA_ALPHA;
+      }
+
+      // 적분 + 벽/장애물
+      for (let i=0;i<parts.length;i++){
+        let p = parts[i];
+        let vx = (p.vx + forcesX[i]*dt) * DAMPING;
+        let vy = (p.vy + forcesY[i]*dt) * DAMPING;
+        const s2 = vx*vx + vy*vy;
+        if (s2 > VMAX*VMAX){
+          const s = VMAX / Math.sqrt(s2); vx*=s; vy*=s;
+        }
+        let x = p.x + vx*dt;
+        let y = p.y + vy*dt;
+
+        if (x < R){ x = R; vx = -vx * BOUNCE; }
+        else if (x > WIDTH - R){ x = WIDTH - R; vx = -vx * BOUNCE; }
+        if (y < R){ y = R; vy = -vy * BOUNCE; }
+        else if (y > HEIGHT - R){ y = HEIGHT - R; vy = -vy * BOUNCE; }
+
+        for (let k=0;k<obstacles.length;k++){
+          const o = obstacles[k];
+          const hit = collideCircleAABB(x,y,vx,vy,o,R,BOUNCE);
+          if (hit.hit){ x = hit.x; y = hit.y; vx = hit.vx*0.95; vy = hit.vy*0.95; }
+        }
+
+        p.x = x; p.y = y; p.vx = vx; p.vy = vy;
+      }
+
+      // 포지션 보정(간결 버전)
+      if (SEP_ITERS > 0){
+        const grid2 = new Map();
+        for (let i=0;i<parts.length;i++){
+          const p = parts[i];
+          const key = hashPos(p.x, p.y);
+          const arr = grid2.get(key);
+          if (arr) arr.push(i); else grid2.set(key, [i]);
+        }
+        const Smin2 = S_MIN*S_MIN;
+        for (const [k, idxs] of grid2.entries()){
+          const [cx, cy] = k.split(',').map(Number);
+          const L0 = idxs;
+          const neighs = [
+            grid2.get((cx+1)+','+(cy+0))||[],
+            grid2.get((cx+0)+','+(cy+1))||[],
+            grid2.get((cx+1)+','+(cy+1))||[],
+            grid2.get((cx-1)+','+(cy+1))||[]
+          ];
+          for (let a=0;a<L0.length;a++){
+            const i = L0[a];
+            const pi = parts[i];
+            for (let b=a+1;b<L0.length;b++){
+              const j = L0[b];
+              const pj = parts[j];
+              let dx = pi.x - pj.x, dy = pi.y - pj.y;
+              let d2 = dx*dx + dy*dy;
+              if (d2 < EPS || d2 > Smin2) continue;
+              const d = Math.sqrt(d2), invd = 1.0/d;
+              const ux = dx*invd, uy = dy*invd;
+              const corr = (S_MIN - d) * 0.5 * BAUMGARTE;
+              pi.x += ux*corr; pi.y += uy*corr;
+              pj.x -= ux*corr; pj.y -= uy*corr;
+            }
+          }
+          for (const neigh of neighs){
+            for (let a=0;a<L0.length;a++){
+              const i = L0[a];
+              const pi = parts[i];
+              for (let b=0;b<neigh.length;b++){
+                const j = neigh[b];
+                const pj = parts[j];
+                let dx = pi.x - pj.x, dy = pi.y - pj.y;
+                let d2 = dx*dx + dy*dy;
+                if (d2 < EPS || d2 > Smin2) continue;
+                const d = Math.sqrt(d2), invd = 1.0/d;
+                const ux = dx*invd, uy = dy*invd;
+                const corr = (S_MIN - d) * 0.5 * BAUMGARTE;
+                pi.x += ux*corr; pi.y += uy*corr;
+                pj.x -= ux*corr; pj.y -= uy*corr;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      // 일시정지: 좌클릭만 이동 (accelEMA는 유지)
+      if (lmb){
+        const grid = new Map();
+        for (let i=0;i<parts.length;i++){
+          const p = parts[i];
+          const key = hashPos(p.x, p.y);
+          const arr = grid.get(key);
+          if (arr) arr.push(i); else grid.set(key, [i]);
+        }
+        const r2max = MOUSE_ATTR_RADIUS*MOUSE_ATTR_RADIUS;
+        const rCells = Math.ceil(MOUSE_ATTR_RADIUS / CELL);
+        const baseCx = (mouseX / CELL | 0), baseCy = (mouseY / CELL | 0);
+        for (let dcx=-rCells; dcx<=rCells; dcx++){
+          for (let dcy=-rCells; dcy<=rCells; dcy++){
+            const arr = grid.get((baseCx+dcx)+','+(baseCy+dcy));
+            if (!arr) continue;
+            for (const i of arr){
+              let p = parts[i];
+              const dx = mouseX - p.x, dy = mouseY - p.y;
+              const d2 = dx*dx + dy*dy;
+              if (EPS < d2 && d2 <= r2max){
+                const d = Math.sqrt(d2), invd = 1.0/d;
+                const ux = dx*invd, uy = dy*invd;
+                const ax = ux * (K_MOUSE * d) - C_MOUSE * p.vx;
+                const ay = uy * (K_MOUSE * d) - C_MOUSE * p.vy;
+                let vx = (p.vx + ax*DT) * DAMPING * LOCAL_DRAG;
+                let vy = (p.vy + ay*DT) * DAMPING * LOCAL_DRAG;
+                const s2 = vx*vx + vy*vy;
+                if (s2 > VMAX*VMAX){ const s = VMAX / Math.sqrt(s2); vx*=s; vy*=s; }
+                let x = p.x + vx*DT;
+                let y = p.y + vy*DT;
+                if (x < R){ x = R; vx = -vx * BOUNCE; }
+                else if (x > WIDTH - R){ x = WIDTH - R; vx = -vx * BOUNCE; }
+                if (y < R){ y = R; vy = -vy * BOUNCE; }
+                else if (y > HEIGHT - R){ y = HEIGHT - R; vy = -vy * BOUNCE; }
+                for (let k=0;k<obstacles.length;k++){
+                  const o = obstacles[k];
+                  const hit = collideCircleAABB(x,y,vx,vy,o,R,BOUNCE);
+                  if (hit.hit){ x = hit.x; y = hit.y; vx = hit.vx*0.95; vy = hit.vy*0.95; }
+                }
+                p.x = x; p.y = y; p.vx = vx; p.vy = vy;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 색상 보간: 파랑(저) → 노랑(중) → 빨강(고)
+  function heatColor01(t){
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    if (t < 0.5){
+      const k = t*2;
+      const r = (0   + k*(255-0))|0;
+      const g = (120 + k*(255-120))|0;
+      const b = (255 + k*(  0-255))|0;
+      return `rgb(${r},${g},${b})`;
+    } else {
+      const k = (t-0.5)*2;
+      const r = 255|0;
+      const g = (255 + k*( 60-255))|0;
+      const b = 0;
+      return `rgb(${r},${g},${b})`;
+    }
+  }
+
+  function render(){
+    ctx.clearRect(0,0,WIDTH,HEIGHT);
+    ctx.fillStyle = '#111319';
+    ctx.fillRect(0,0,WIDTH,HEIGHT);
+
+    // 장애물
+    const mx = mouseX, my = mouseY;
+    let hovered = -1;
+    for (let i=obstacles.length-1; i>=0; i--){
+      if (pointInRect(mx,my,obstacles[i])){ hovered = i; break; }
+    }
+    for (let i=0;i<obstacles.length;i++){
+      const o = obstacles[i];
+      ctx.fillStyle = 'rgb(40,60,85)';
+      ctx.fillRect(o.l, o.t, o.r-o.l, o.b-o.t);
+      ctx.strokeStyle = (i===hovered)? 'rgb(160,190,230)' : 'rgb(110,140,180)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(o.l, o.t, o.r-o.l, o.b-o.t);
+    }
+
+    // 우클릭 드래그 프리뷰
+    if (rmb){
+      const l = Math.min(rmbStart.x, mx), r = Math.max(rmbStart.x, mx);
+      const t = Math.min(rmbStart.y, my), b = Math.max(rmbStart.y, my);
+      ctx.fillStyle = 'rgb(70,90,120)'; ctx.fillRect(l,t,r-l,b-t);
+      ctx.strokeStyle = 'rgb(160,190,230)'; ctx.strokeRect(l,t,r-l,b-t);
+    }
+    // LMB 반경
+    if (lmb){
+      ctx.strokeStyle = 'rgb(70,70,90)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(mx, my, MOUSE_ATTR_RADIUS, 0, Math.PI*2); ctx.stroke();
+    }
+
+    // 입자 렌더
+    if (densityMode && accelEMA.length === parts.length){
+      for (let i=0;i<parts.length;i++){
+        const p = parts[i];
+        const t = Math.min(1, accelEMA[i] / ACCEL_RED);
+        ctx.fillStyle = heatColor01(t);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, R, 0, Math.PI*2);
+        ctx.fill();
+      }
+    } else {
+      ctx.fillStyle = 'rgb(70,170,255)';
+      for (let i=0;i<parts.length;i++){
+        const p = parts[i];
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, R, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+
+    // HUD
+    hud.textContent =
+      `${paused?'PAUSED':'RUN'} | N=${parts.length}  Obst:${obstacles.length}  `
+      + `G:${GRAVITY_ON?'ON':'OFF'}  AccelHeat:${densityMode?'ON':'OFF'}  `
+      + `(scale=${ACCEL_RED.toFixed(0)} | +/-로 조절)  |  `
+      + `Space:Pause  R:Reset  G:Gravity  HOME:StopAll  END:ClearWater  `
+      + `C:Clear Obst  RMB:Drag Rect  DEL:Delete hovered  Wheel/MMB:Add water  M:Heatmap`;
+  }
+
+  requestAnimationFrame(step);
+})();
+</script>
+</body>
+</html>
