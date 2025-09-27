@@ -10,8 +10,8 @@
     margin: 0; padding: 0; height: 100%; background: #111319; overflow: hidden;
     font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans KR", Arial;
   }
-  #wrap { position: fixed; inset: 0; display: grid; place-items: center; }
-  canvas { background:#111319; display:block; box-shadow: 0 0 40px rgba(0,0,0,0.35); }
+  #wrap { position: fixed; inset: 0; }
+  canvas { background:#111319; display:block; width:100vw; height:100vh; }
   .hud {
     position: fixed; left: 12px; top: 10px; right: 12px; pointer-events: none;
     color: #d2dce6; font-size: 14px; text-shadow: 0 1px 0 rgba(0,0,0,0.3);
@@ -25,27 +25,28 @@
 </head>
 <body>
 <div id="wrap">
-  <canvas id="cv" width="800" height="1350"></canvas>
+  <canvas id="cv"></canvas>
 </div>
 <div class="hud" id="hud"></div>
 <div class="hint">
   LMB: attract &nbsp; | &nbsp; RMB drag: obstacle &nbsp; | &nbsp; Wheel/MMB: spawn &nbsp; | &nbsp;
-  Space:Pause R:Reset G:Gravity Home:Stop End:ClearWater C:ClearObs Delete:Remove hovered &nbsp;|&nbsp; M:Accel-Heatmap
+  Space:Pause R:Reset G:Gravity Home:Stop End:ClearWater C:ClearObs Delete:Remove hovered &nbsp;|&nbsp;
+  M:Accel-Heatmap &nbsp;|&nbsp; V:Vectors &nbsp;|&nbsp; H:Add gravity point &nbsp; J:Clear gravity points
 </div>
 
 <script>
 (() => {
   'use strict';
 
-  // ---------------- 설정 ----------------
-  const WIDTH = 3200, HEIGHT = 1800;
-  let N = 5000;
+  // ---------------- 기본 설정 (기존 값 유지) ----------------
+  let WIDTH = 3200, HEIGHT = 1800;   // 실제 렌더는 윈도우 크기에 맞추고, 이 값도 함께 갱신됨
+  let N = 3000;
   const R = 4;
   const DT = 1/60;
   const DAMPING = 0.986;
   const BOUNCE = 0.8;
-  let GRAVITY_ON = true;
-  const GRAVITY = {x: 0.0, y: 120.0};
+  let GRAVITY_ON = true;                    // 기본 중력 ON/OFF
+  const GRAVITY = {x: 0.0, y: 120.0};       // 기본 중력 가속도
 
   // 상호작용
   let S = 2*R + 10;    // 선호 거리
@@ -84,9 +85,23 @@
   const SPAWN_PER_MMB_TAP  = 80;
   const SPAWN_PER_MMB_HOLD = 18;
 
-  // 가속도 히트맵 스케일(빨강이 되는 기준 a). 상황에 따라 600~2000 사이에서 취향대로 조절.
+  // 가속도 히트맵
   let ACCEL_RED = 6500;
-  const ACCEL_EMA_ALPHA = 0.1;  // EMA 부드럽기 (0.2~0.4 권장)
+  const ACCEL_EMA_ALPHA = 0.1;
+
+  // 벡터(유동) 오버레이
+  let showVectors = true;
+  let GRID_COLS = 160, GRID_ROWS = 90;
+  let cellW = 0, cellH = 0;
+  const VECTOR_GAIN = 0.85;   // 화살표 스케일(시각화 전용)
+  const VECTOR_MIN = 0.06;    // 너무 작으면 생략
+  const VECTOR_MAX = 14;      // 너무 크면 캡
+
+  // 중력점 (여러 개 가능, 합력. 점이 많을수록 점당 힘 감소)
+  let gravityPoints = [];
+  const GP_TOTAL_STRENGTH = 1200.0; // 총 중력 예산 (점 수로 나눔)
+  const GP_FALLOFF = 0.0025;        // 거리 감쇠(값↑일수록 빨리 약해짐)
+  const GP_SOFT = 6.0;              // 극근거리 발산 방지 소프트닝 반경(px)
 
   // Spatial hash
   let CELL = CUT;
@@ -95,16 +110,23 @@
   const cv = document.getElementById('cv');
   const hud = document.getElementById('hud');
   const ctx = cv.getContext('2d');
-  function setupHiDPI() {
+
+  // 창 크기에 맞춰 해상도/월드 경계 갱신
+  function resizeToWindow() {
     const dpr = Math.max(1, window.devicePixelRatio || 1);
-    cv.style.width = WIDTH + 'px';
-    cv.style.height = HEIGHT + 'px';
+    WIDTH = Math.max(200, window.innerWidth);
+    HEIGHT = Math.max(200, window.innerHeight);
     cv.width = Math.floor(WIDTH * dpr);
     cv.height = Math.floor(HEIGHT * dpr);
+    cv.style.width = WIDTH + 'px';
+    cv.style.height = HEIGHT + 'px';
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // 벡터 그리드 셀 크기 재계산
+    cellW = WIDTH / GRID_COLS;
+    cellH = HEIGHT / GRID_ROWS;
   }
-  setupHiDPI();
-  window.addEventListener('resize', setupHiDPI);
+  resizeToWindow();
+  window.addEventListener('resize', resizeToWindow);
 
   // ---------- 유틸 ----------
   const rnd = Math.random;
@@ -153,11 +175,14 @@
   cv.addEventListener('contextmenu', e => e.preventDefault(), {passive:false});
 
   // 마우스 이벤트
-  cv.addEventListener('mousedown', (e) => {
-    e.preventDefault();
+  function updateMouse(e){
     const rect = cv.getBoundingClientRect();
     mouseX = (e.clientX - rect.left);
     mouseY = (e.clientY - rect.top);
+  }
+  cv.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    updateMouse(e);
     if (e.button === 0) lmb = true;
     else if (e.button === 2){ rmb = true; rmbStart = {x:mouseX, y:mouseY}; }
     else if (e.button === 1){
@@ -179,11 +204,7 @@
     }
   }, {passive:false});
 
-  cv.addEventListener('mousemove', (e) => {
-    const rect = cv.getBoundingClientRect();
-    mouseX = (e.clientX - rect.left);
-    mouseY = (e.clientY - rect.top);
-  }, {passive:true});
+  cv.addEventListener('mousemove', (e) => { updateMouse(e); }, {passive:true});
 
   // 휠 스크롤로 스폰
   cv.addEventListener('wheel', (e) => {
@@ -196,7 +217,7 @@
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space'){ paused = !paused; e.preventDefault(); }
     else if (e.key === 'r' || e.key === 'R'){ resetParticles(); }
-    else if (e.key === 'g' || e.key === 'G'){ GRAVITY_ON = !GRAVITY_ON; }
+    else if (e.key === 'g' || e.key === 'G'){ GRAVITY_ON = !GRAVITY_ON; }       // 수동 토글(중력점 없을 때 의미있음)
     else if (e.key === 'c' || e.key === 'C'){ obstacles.length = 0; }
     else if (e.key === 'Delete'){
       for (let i = obstacles.length-1; i >= 0; i--){
@@ -215,6 +236,16 @@
       ACCEL_RED *= 0.9;
     } else if (e.key === '-'){  // 히트맵 감도 ↓
       ACCEL_RED *= 1.1;
+    } else if (e.key === 'v' || e.key === 'V'){
+      showVectors = !showVectors;
+    } else if (e.key === 'h' || e.key === 'H'){
+      // 중력점 추가 + 기본 중력 비활성화
+      gravityPoints.push({x: mouseX, y: mouseY});
+      GRAVITY_ON = false;
+    } else if (e.key === 'j' || e.key === 'J'){
+      // 중력점 전체 제거 + 기본 중력 복원
+      gravityPoints.length = 0;
+      GRAVITY_ON = true;
     }
   }, {passive:false});
 
@@ -452,18 +483,39 @@
         }
       }
 
-      // 중력
-      if (GRAVITY_ON){
+      // --- 기본 중력 또는 중력점 중력 ---
+      if (gravityPoints.length === 0){
+        if (GRAVITY_ON){
+          for (let i=0;i<parts.length;i++){
+            forcesX[i] += GRAVITY.x;
+            forcesY[i] += GRAVITY.y;
+          }
+        }
+      } else {
+        // 점이 많을수록 점당 힘을 줄여 총합이 일정해지게
+        const perPoint = GP_TOTAL_STRENGTH / gravityPoints.length;
         for (let i=0;i<parts.length;i++){
-          forcesX[i] += GRAVITY.x;
-          forcesY[i] += GRAVITY.y;
+          const p = parts[i];
+          let fx = 0, fy = 0;
+          for (let gp of gravityPoints){
+            let dx = gp.x - p.x, dy = gp.y - p.y;
+            const dist = Math.hypot(dx, dy);
+            // 방향 단위벡터
+            if (dist > 1e-6){ dx /= dist; dy /= dist; }
+            // 거리 감쇠 (가까울수록 강, 멀수록 약)
+            const atten = 1.0 / (1.0 + GP_FALLOFF * Math.max(0, dist - GP_SOFT));
+            fx += dx * perPoint * atten;
+            fy += dy * perPoint * atten;
+          }
+          forcesX[i] += fx;
+          forcesY[i] += fy;
         }
       }
 
       // === 가속도(=힘) 크기 기반 히트맵 값 계산 + EMA 저장 ===
       ensureAccelLen();
       for (let i=0;i<parts.length;i++){
-        const ax = forcesX[i];  // 질량=1 가정
+        const ax = forcesX[i];
         const ay = forcesY[i];
         const a = Math.hypot(ax, ay);
         accelEMA[i] = accelEMA[i]*(1-ACCEL_EMA_ALPHA) + a*ACCEL_EMA_ALPHA;
@@ -618,6 +670,40 @@
     }
   }
 
+  function drawArrow(x0, y0, vx, vy){
+    // vx,vy: 셀 평균 속도(또는 이동) 벡터
+    let len = Math.hypot(vx, vy);
+    if (len < VECTOR_MIN) return;
+    // 시각 스케일링
+    let scale = VECTOR_GAIN;
+    let L = Math.min(VECTOR_MAX, len * scale);
+
+    const nx = vx / (len + 1e-9);
+    const ny = vy / (len + 1e-9);
+    const x1 = x0 + nx * L;
+    const y1 = y0 + ny * L;
+
+    ctx.strokeStyle = 'rgba(230,230,255,0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+
+    // 화살촉
+    const ah = Math.min(8, 2 + L*0.25);  // 길이에 비례해서 조금 크게
+    const aw = Math.min(6, 1 + L*0.18);
+    // 좌우 법선
+    const px = -ny, py = nx;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - nx*ah + px*aw, y1 - ny*ah + py*aw);
+    ctx.lineTo(x1 - nx*ah - px*aw, y1 - ny*ah - py*aw);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(230,230,255,0.9)';
+    ctx.fill();
+  }
+
   function render(){
     ctx.clearRect(0,0,WIDTH,HEIGHT);
     ctx.fillStyle = '#111319';
@@ -671,13 +757,57 @@
       }
     }
 
+    // 중력점 표시
+    if (gravityPoints.length){
+      ctx.fillStyle = 'rgba(255,200,80,0.9)';
+      ctx.strokeStyle = 'rgba(255,230,160,0.9)';
+      for (const gp of gravityPoints){
+        ctx.beginPath();
+        ctx.arc(gp.x, gp.y, 6, 0, Math.PI*2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(gp.x, gp.y, GP_SOFT, 0, Math.PI*2);
+        ctx.stroke();
+      }
+    }
+
+    // 벡터(그리드 평균 속도) 오버레이
+    if (showVectors){
+      // 셀 집계
+      const sumVX = Array.from({length: GRID_COLS*GRID_ROWS}, () => 0);
+      const sumVY = Array.from({length: GRID_COLS*GRID_ROWS}, () => 0);
+      const cnt   = Array.from({length: GRID_COLS*GRID_ROWS}, () => 0);
+      for (const p of parts){
+        const gx = Math.max(0, Math.min(GRID_COLS-1, Math.floor(p.x / cellW)));
+        const gy = Math.max(0, Math.min(GRID_ROWS-1, Math.floor(p.y / cellH)));
+        const idx = gy*GRID_COLS + gx;
+        sumVX[idx] += p.vx;
+        sumVY[idx] += p.vy;
+        cnt[idx]   += 1;
+      }
+      // 화살표
+      for (let gy=0; gy<GRID_ROWS; gy++){
+        for (let gx=0; gx<GRID_COLS; gx++){
+          const idx = gy*GRID_COLS + gx;
+          if (cnt[idx] === 0) continue;
+          const cx = (gx + 0.5) * cellW;
+          const cy = (gy + 0.5) * cellH;
+          const vx = (sumVX[idx] / cnt[idx]);
+          const vy = (sumVY[idx] / cnt[idx]);
+          drawArrow(cx, cy, vx, vy);
+        }
+      }
+    }
+
     // HUD
     hud.textContent =
       `${paused?'PAUSED':'RUN'} | N=${parts.length}  Obst:${obstacles.length}  `
       + `G:${GRAVITY_ON?'ON':'OFF'}  AccelHeat:${densityMode?'ON':'OFF'}  `
+      + `Vec:${showVectors?'ON':'OFF'}  GP:${gravityPoints.length}  `
       + `(scale=${ACCEL_RED.toFixed(0)} | +/-로 조절)  |  `
       + `Space:Pause  R:Reset  G:Gravity  HOME:StopAll  END:ClearWater  `
-      + `C:Clear Obst  RMB:Drag Rect  DEL:Delete hovered  Wheel/MMB:Add water  M:Heatmap`;
+      + `C:Clear Obst  RMB:Drag Rect  DEL:Delete hovered  `
+      + `Wheel/MMB:Add water  M:Heatmap  V:Vectors  H:Add GP  J:Clear GP`;
   }
 
   requestAnimationFrame(step);
